@@ -1,169 +1,172 @@
-"""SQLite audit log for ClawSafe."""
+"""
+Local SQLite audit log.
 
-import sqlite3
+Design decisions:
+- Uses aiosqlite for async operations (non-blocking in the proxy event loop)
+- Arguments are stored LOCALLY and never synced to the dashboard
+- The dashboard only receives: timestamp, tool, verdict, rule_name, reason
+"""
+
+from __future__ import annotations
+
 import json
-from datetime import datetime
-from dataclasses import dataclass
+import logging
+import time
 from pathlib import Path
-from typing import Any, Optional
 
-from .config import config_dir
+import aiosqlite
+
+logger = logging.getLogger(__name__)
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS events (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp   REAL    NOT NULL,
+    tool        TEXT    NOT NULL,
+    arguments   TEXT    NOT NULL,
+    verdict     TEXT    NOT NULL CHECK (verdict IN ('allow', 'block', 'gray')),
+    rule_name   TEXT    DEFAULT '',
+    reason      TEXT    DEFAULT '',
+    cloud_used  INTEGER DEFAULT 0,
+    overridden  INTEGER DEFAULT 0,
+    synced      INTEGER DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS allowlist (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    tool            TEXT    NOT NULL,
+    argument_hash   TEXT,
+    note            TEXT    DEFAULT '',
+    created_at      REAL    NOT NULL DEFAULT (unixepoch())
+);
+
+CREATE INDEX IF NOT EXISTS idx_events_timestamp ON events(timestamp DESC);
+CREATE INDEX IF NOT EXISTS idx_events_synced    ON events(synced, timestamp);
+CREATE INDEX IF NOT EXISTS idx_events_verdict   ON events(verdict, timestamp DESC);
+"""
 
 
-@dataclass
-class Event:
-    id: int
-    timestamp: datetime
-    tool: str
-    arguments: str  # JSON string
-    verdict: str
-    rule: str
-    reason: str
-    cloud_judgment: bool
-    override: bool
-    synced: bool
+class AuditLog:
+    """Async SQLite audit log."""
 
-
-class AuditStore:
-    """SQLite-backed audit log."""
-
-    def __init__(self, db_path: Optional[Path] = None):
-        if db_path is None:
-            db_path = config_dir() / "audit.db"
-
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-
+    def __init__(self, db_path: Path):
         self.db_path = db_path
-        self.conn = sqlite3.connect(str(db_path), check_same_thread=False)
-        self._init_schema()
+        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        self._db: aiosqlite.Connection | None = None
 
-    def _init_schema(self):
-        """Initialize database schema."""
-        self.conn.executescript("""
-            CREATE TABLE IF NOT EXISTS events (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
-                tool TEXT NOT NULL,
-                arguments TEXT NOT NULL,
-                verdict TEXT NOT NULL,
-                rule TEXT,
-                reason TEXT,
-                cloud_judgment INTEGER DEFAULT 0,
-                override INTEGER DEFAULT 0,
-                synced INTEGER DEFAULT 0
-            );
+    async def initialize(self) -> None:
+        """Open the database connection and create tables."""
+        self._db = await aiosqlite.connect(str(self.db_path))
+        self._db.row_factory = aiosqlite.Row
+        await self._db.executescript(SCHEMA)
+        await self._db.commit()
+        logger.info(f"Audit log initialized: {self.db_path}")
 
-            CREATE TABLE IF NOT EXISTS config (
-                key TEXT PRIMARY KEY,
-                value TEXT
-            );
+    async def close(self) -> None:
+        if self._db:
+            await self._db.close()
 
-            CREATE TABLE IF NOT EXISTS allowlist (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                tool TEXT NOT NULL,
-                argument_pattern TEXT,
-                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-            );
-
-            CREATE INDEX IF NOT EXISTS idx_events_timestamp ON events(timestamp DESC);
-            CREATE INDEX IF NOT EXISTS idx_events_tool ON events(tool);
-            CREATE INDEX IF NOT EXISTS idx_events_verdict ON events(verdict);
-        """)
-        self.conn.commit()
-
-    def log_event(
+    async def log_event(
         self,
         tool: str,
-        arguments: dict[str, Any],
+        arguments: dict,
         verdict: str,
-        rule: str,
-        reason: str,
-        cloud_judgment: bool = False,
-        override: bool = False,
-    ) -> Event:
-        """Log a tool call event."""
-        args_json = json.dumps(arguments)
-
-        cursor = self.conn.execute(
-            """
-            INSERT INTO events (tool, arguments, verdict, rule, reason, cloud_judgment, override)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-            """,
-            (tool, args_json, verdict, rule, reason, int(cloud_judgment), int(override))
+        rule_name: str = "",
+        reason: str = "",
+        cloud_used: bool = False,
+        overridden: bool = False,
+    ) -> int:
+        """Insert one event into the audit log. Returns the new row ID."""
+        cursor = await self._db.execute(
+            """INSERT INTO events
+               (timestamp, tool, arguments, verdict, rule_name, reason, cloud_used, overridden)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                time.time(),
+                tool,
+                json.dumps(arguments),
+                verdict,
+                rule_name,
+                reason,
+                int(cloud_used),
+                int(overridden),
+            )
         )
-        self.conn.commit()
+        await self._db.commit()
+        return cursor.lastrowid
 
-        return Event(
-            id=cursor.lastrowid,
-            timestamp=datetime.now(),
-            tool=tool,
-            arguments=args_json,
-            verdict=verdict,
-            rule=rule,
-            reason=reason,
-            cloud_judgment=cloud_judgment,
-            override=override,
-            synced=False,
-        )
-
-    def get_recent_events(self, limit: int = 20) -> list[Event]:
-        """Get most recent events."""
-        cursor = self.conn.execute(
-            """
-            SELECT id, timestamp, tool, arguments, verdict, rule, reason,
-                   cloud_judgment, override, synced
-            FROM events
-            ORDER BY timestamp DESC
-            LIMIT ?
-            """,
+    async def get_unsynced(self, limit: int = 100) -> list[dict]:
+        """Return events not yet synced to the dashboard (arguments excluded)."""
+        async with self._db.execute(
+            """SELECT id, timestamp, tool, verdict, rule_name, reason, cloud_used
+               FROM events
+               WHERE synced = 0
+               ORDER BY timestamp
+               LIMIT ?""",
             (limit,)
+        ) as cursor:
+            rows = await cursor.fetchall()
+
+        return [
+            {
+                "id": row["id"],
+                "timestamp": row["timestamp"],
+                "tool": row["tool"],
+                "verdict": row["verdict"],
+                "rule_name": row["rule_name"],
+                "reason": row["reason"],
+                "cloud_used": bool(row["cloud_used"]),
+            }
+            for row in rows
+        ]
+
+    async def mark_synced(self, event_ids: list[int]) -> None:
+        """Mark events as synced after successful dashboard upload."""
+        if not event_ids:
+            return
+        placeholders = ",".join("?" * len(event_ids))
+        await self._db.execute(
+            f"UPDATE events SET synced = 1 WHERE id IN ({placeholders})",
+            event_ids
         )
+        await self._db.commit()
 
-        events = []
-        for row in cursor:
-            events.append(Event(
-                id=row[0],
-                timestamp=datetime.fromisoformat(row[1]) if row[1] else datetime.now(),
-                tool=row[2],
-                arguments=row[3],
-                verdict=row[4],
-                rule=row[5] or "",
-                reason=row[6] or "",
-                cloud_judgment=bool(row[7]),
-                override=bool(row[8]),
-                synced=bool(row[9]),
-            ))
+    async def recent(self, limit: int = 50, verdict_filter: str | None = None) -> list[dict]:
+        """Get recent events for the CLI logs command."""
+        if verdict_filter:
+            query = "SELECT * FROM events WHERE verdict = ? ORDER BY timestamp DESC LIMIT ?"
+            params = (verdict_filter, limit)
+        else:
+            query = "SELECT * FROM events ORDER BY timestamp DESC LIMIT ?"
+            params = (limit,)
 
-        return events
+        async with self._db.execute(query, params) as cursor:
+            rows = await cursor.fetchall()
 
-    def get_stats(self) -> tuple[int, int, int]:
-        """Get counts of allowed, blocked, and gray events."""
-        cursor = self.conn.execute("""
-            SELECT
-                COALESCE(SUM(CASE WHEN verdict = 'allow' THEN 1 ELSE 0 END), 0),
-                COALESCE(SUM(CASE WHEN verdict = 'block' THEN 1 ELSE 0 END), 0),
-                COALESCE(SUM(CASE WHEN verdict = 'gray' THEN 1 ELSE 0 END), 0)
-            FROM events
-        """)
-        row = cursor.fetchone()
-        return row[0], row[1], row[2]
+        return [
+            {
+                "id": row["id"],
+                "timestamp": row["timestamp"],
+                "tool": row["tool"],
+                "arguments": json.loads(row["arguments"]),
+                "verdict": row["verdict"],
+                "rule_name": row["rule_name"],
+                "reason": row["reason"],
+                "cloud_used": bool(row["cloud_used"]),
+                "overridden": bool(row["overridden"]),
+            }
+            for row in rows
+        ]
 
-    def add_to_allowlist(self, tool: str, argument_pattern: Optional[str] = None):
-        """Add a tool to the allowlist."""
-        self.conn.execute(
-            "INSERT INTO allowlist (tool, argument_pattern) VALUES (?, ?)",
-            (tool, argument_pattern)
-        )
-        self.conn.commit()
+    async def stats(self) -> dict:
+        """Return summary statistics for the status command."""
+        async with self._db.execute(
+            """SELECT verdict, COUNT(*) as count FROM events GROUP BY verdict"""
+        ) as cursor:
+            rows = await cursor.fetchall()
 
-    def is_in_allowlist(self, tool: str) -> bool:
-        """Check if a tool is in the allowlist."""
-        cursor = self.conn.execute(
-            "SELECT COUNT(*) FROM allowlist WHERE tool = ?",
-            (tool,)
-        )
-        return cursor.fetchone()[0] > 0
-
-    def close(self):
-        """Close the database connection."""
-        self.conn.close()
+        result = {"allow": 0, "block": 0, "gray": 0, "total": 0}
+        for row in rows:
+            result[row["verdict"]] = row["count"]
+            result["total"] += row["count"]
+        return result

@@ -1,289 +1,272 @@
-"""WebSocket and HTTP proxy server for ClawSafe."""
+"""
+ClawSafe Proxy Server.
+
+Listens on localhost:18790 (WebSocket only — never 0.0.0.0).
+Intercepts, evaluates, and either forwards or blocks each tool call.
+
+GRAY handling:
+  Free tier: immediately BLOCK
+  Paid tier: ask cloud judge -> if BLOCK, block. If ALLOW, hold 60s for user override.
+"""
+
+from __future__ import annotations
 
 import asyncio
 import json
 import logging
 import uuid
-from typing import Any, Callable, Optional
-from contextlib import asynccontextmanager
+from typing import Any
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
-from fastapi.responses import JSONResponse
 import httpx
-import uvicorn
+import websockets
+import websockets.server
 
-from .rules import RuleEngine, RuleConfig, ToolCall, Verdict
-from .audit import AuditStore
-from .config import load_config
-from .notify import TelegramBot, UserResponse
+from .audit import AuditLog
+from .cloud import CloudJudge
+from .config import Config
+from .notify import Notifier
+from .rules.engine import RuleEngine
+from .rules.models import Decision, ToolCall, Verdict
 
-logger = logging.getLogger("clawsafe")
-
-
-class JSONRPCError:
-    PARSE_ERROR = -32700
-    INVALID_REQUEST = -32600
-    INVALID_PARAMS = -32602
-    INTERNAL_ERROR = -32603
-    BLOCKED = -32000
-    GRAY = -32001
-
-
-def make_error_response(id: Any, code: int, message: str, data: Any = None) -> dict:
-    """Create a JSON-RPC error response."""
-    error = {"code": code, "message": message}
-    if data:
-        error["data"] = data
-    return {"jsonrpc": "2.0", "error": error, "id": id}
-
-
-def make_success_response(id: Any, result: Any) -> dict:
-    """Create a JSON-RPC success response."""
-    return {"jsonrpc": "2.0", "result": result, "id": id}
+logger = logging.getLogger(__name__)
 
 
 class ClawSafeProxy:
-    """The main proxy server that intercepts tool calls."""
 
-    def __init__(
-        self,
-        port: int = 18790,
-        rule_config: Optional[RuleConfig] = None,
-        target_endpoint: str = "",
-        on_block: Optional[Callable[[str, str], None]] = None,
-    ):
-        self.port = port
-        self.engine = RuleEngine(rule_config)
-        self.store = AuditStore()
-        self.target_endpoint = target_endpoint
-        self.on_block = on_block
-        self.http_client: Optional[httpx.AsyncClient] = None
+    def __init__(self, config: Config):
+        self.config = config
+        self.rule_engine = RuleEngine(config.config_dir, config)
+        self.audit = AuditLog(config.config_dir / "audit.db")
+        self.notifier = Notifier(config)
+        self.cloud_judge = CloudJudge(config) if config.cloud_enabled else None
+        self._forward_client = httpx.AsyncClient(timeout=30.0)
 
-        # Load config for notifications
-        self.config = load_config()
-        self.telegram_bot = TelegramBot()
-        self.hold_timeout = self.config.proxy.hold_timeout_seconds
+        # Pending GRAY actions awaiting user override
+        self._pending: dict[str, asyncio.Future] = {}
 
-        @asynccontextmanager
-        async def lifespan(app: FastAPI):
-            self.http_client = httpx.AsyncClient(timeout=30.0)
-            yield
-            await self.http_client.aclose()
-            self.store.close()
+        self.notifier.set_proxy(self)
 
-        self.app = FastAPI(lifespan=lifespan)
-        self._setup_routes()
+    async def start(self) -> None:
+        """Initialize all components and start the WebSocket server."""
+        await self.audit.initialize()
+        await self.notifier.initialize()
 
-    def _setup_routes(self):
-        """Set up FastAPI routes."""
+        logger.info(f"ClawSafe proxy starting on localhost:{self.config.proxy_port}")
+        logger.info(f"Rule engine: {self.rule_engine.rule_count} rules loaded")
+        logger.info(f"Cloud judge: {'enabled' if self.cloud_judge else 'disabled (free tier)'}")
 
-        @self.app.get("/health")
-        async def health():
-            return {"status": "ok"}
+        async with websockets.server.serve(
+            self._handle_connection,
+            "127.0.0.1",
+            self.config.proxy_port,
+            ping_interval=30,
+            ping_timeout=10,
+        ):
+            logger.info(f"ClawSafe proxy listening on ws://127.0.0.1:{self.config.proxy_port}")
+            await asyncio.Future()  # Run forever
 
-        @self.app.post("/")
-        async def handle_http(request: Request):
-            body = await request.body()
-            response = await self._process_message(body)
-            return JSONResponse(content=response)
-
-        @self.app.websocket("/")
-        async def handle_websocket(websocket: WebSocket):
-            await websocket.accept()
-            try:
-                while True:
-                    message = await websocket.receive_text()
-                    response = await self._process_message(message.encode())
-                    await websocket.send_text(json.dumps(response))
-            except WebSocketDisconnect:
-                pass
-
-    async def _process_message(self, message: bytes) -> dict:
-        """Process a JSON-RPC message and return response."""
+    async def _handle_connection(self, websocket: websockets.server.WebSocketServerProtocol) -> None:
+        """Handle one WebSocket connection from OpenClaw."""
+        logger.info(f"OpenClaw connected from {websocket.remote_address}")
         try:
-            req = json.loads(message)
-        except json.JSONDecodeError:
-            return make_error_response(None, JSONRPCError.PARSE_ERROR, "Parse error")
+            async for raw_message in websocket:
+                try:
+                    response = await self._handle_message(str(raw_message))
+                    await websocket.send(json.dumps(response))
+                except Exception as e:
+                    logger.error(f"Error handling message: {e}")
+                    error_resp = self._make_error(None, f"ClawSafe internal error: {e}")
+                    await websocket.send(json.dumps(error_resp))
+        except websockets.exceptions.ConnectionClosed:
+            logger.info("OpenClaw disconnected")
 
-        req_id = req.get("id")
-        method = req.get("method", "")
+    async def _handle_message(self, raw: str) -> dict[str, Any]:
+        """Parse and route a single message."""
+        try:
+            message = json.loads(raw)
+        except json.JSONDecodeError as e:
+            return self._make_error(None, f"Invalid JSON from agent: {e}")
 
-        # Only intercept tool/call requests
-        if method != "tool/call":
-            return await self._forward_request(req)
+        if message.get("method") != "tool/call":
+            return await self._forward_raw(message)
 
-        params = req.get("params", {})
-        tool = params.get("tool", "")
-        arguments = params.get("arguments", {})
+        try:
+            call = ToolCall.from_jsonrpc(message)
+        except Exception as e:
+            return self._make_error(message.get("id"), f"Invalid tool call format: {e}")
 
-        # Evaluate against rules
-        call = ToolCall(tool=tool, arguments=arguments)
-        decision = self.engine.evaluate(call)
+        return await self._process_tool_call(call)
+
+    async def _process_tool_call(self, call: ToolCall) -> dict[str, Any]:
+        """Main decision routing for a single tool call."""
+        decision = self.rule_engine.evaluate(call)
+
+        if decision.verdict == Verdict.ALLOW:
+            await self.audit.log_event(
+                tool=call.tool,
+                arguments=call.arguments,
+                verdict="allow",
+                rule_name=decision.rule_name,
+                reason=decision.reason,
+            )
+            return await self._forward_raw(call.raw)
 
         if decision.verdict == Verdict.BLOCK:
-            # Log and return block
-            self.store.log_event(
-                tool=tool,
-                arguments=arguments,
+            await self.audit.log_event(
+                tool=call.tool,
+                arguments=call.arguments,
                 verdict="block",
-                rule=decision.rule,
+                rule_name=decision.rule_name,
                 reason=decision.reason,
             )
+            await self.notifier.notify_block(call.tool, call.arguments, decision)
+            return self._make_error(
+                call.request_id,
+                f"ClawSafe blocked: {decision.reason}"
+            )
 
-            logger.warning(f"BLOCKED: {tool} - {decision.reason}")
-            if self.on_block:
-                self.on_block(tool, decision.reason)
+        if decision.verdict == Verdict.GRAY:
+            return await self._handle_gray(call, decision)
 
-            # Send Telegram notification (fire and forget)
-            if self.telegram_bot.is_configured:
-                asyncio.create_task(
-                    self.telegram_bot.notify_block(tool, decision.reason, arguments)
+        return self._make_error(call.request_id, "ClawSafe: unknown verdict")
+
+    async def _handle_gray(self, call: ToolCall, initial_decision: Decision) -> dict[str, Any]:
+        """Handle a GRAY (ambiguous) action."""
+        if not self.cloud_judge:
+            # Free tier: gray area defaults to BLOCK
+            block_decision = Decision.block(
+                reason=(
+                    f"{initial_decision.reason} "
+                    "(Upgrade to Shell plan for AI-assisted gray area judgment)"
+                ),
+                rule_name=initial_decision.rule_name
+            )
+            await self.audit.log_event(
+                tool=call.tool,
+                arguments=call.arguments,
+                verdict="block",
+                rule_name=block_decision.rule_name,
+                reason=block_decision.reason,
+            )
+            await self.notifier.notify_block(call.tool, call.arguments, block_decision, gray=True)
+            return self._make_error(call.request_id, block_decision.reason)
+
+        # Paid tier: consult cloud judge
+        cloud_decision = await self.cloud_judge.judge(call)
+
+        if cloud_decision.verdict == Verdict.BLOCK:
+            await self.audit.log_event(
+                tool=call.tool,
+                arguments=call.arguments,
+                verdict="block",
+                rule_name=cloud_decision.rule_name,
+                reason=cloud_decision.reason,
+                cloud_used=True,
+            )
+            await self.notifier.notify_block(call.tool, call.arguments, cloud_decision, gray=True)
+            return self._make_error(call.request_id, cloud_decision.reason)
+
+        # Cloud says ALLOW — give user 60s to override
+        action_id = str(uuid.uuid4())
+        loop = asyncio.get_event_loop()
+        future: asyncio.Future[str] = loop.create_future()
+        self._pending[action_id] = future
+
+        try:
+            await self.notifier.notify_gray_pending(
+                tool=call.tool,
+                arguments=call.arguments,
+                cloud_decision=cloud_decision,
+                action_id=action_id,
+                timeout_seconds=self.config.hold_timeout_seconds,
+            )
+
+            try:
+                user_override = await asyncio.wait_for(
+                    future,
+                    timeout=float(self.config.hold_timeout_seconds)
+                )
+            except asyncio.TimeoutError:
+                user_override = "allow"
+                logger.info(
+                    f"Gray action {action_id[:8]} timed out — defaulting to ALLOW (cloud said OK)"
                 )
 
-            return make_error_response(
-                req_id,
-                JSONRPCError.BLOCKED,
-                f"ClawSafe blocked: {decision.reason}",
-                {"verdict": "block", "rule": decision.rule}
-            )
+        finally:
+            self._pending.pop(action_id, None)
 
-        elif decision.verdict == Verdict.GRAY:
-            # Handle gray area - needs human approval via Telegram
-            return await self._handle_gray(
-                req_id, tool, arguments, decision.rule, decision.reason
-            )
-
-        else:
-            # ALLOW - log and forward
-            self.store.log_event(
-                tool=tool,
-                arguments=arguments,
+        if user_override == "allow":
+            await self.audit.log_event(
+                tool=call.tool,
+                arguments=call.arguments,
                 verdict="allow",
-                rule=decision.rule,
-                reason=decision.reason,
+                rule_name=cloud_decision.rule_name,
+                reason="Cloud: OK, user: no response (timeout) / allowed",
+                cloud_used=True,
             )
-            logger.info(f"ALLOWED: {tool}")
-            return await self._forward_request(req)
-
-    async def _handle_gray(
-        self,
-        req_id: Any,
-        tool: str,
-        arguments: dict,
-        rule: str,
-        reason: str,
-    ) -> dict:
-        """Handle a gray area decision - get human approval via Telegram."""
-        request_id = str(uuid.uuid4())[:8]
-        logger.warning(f"GRAY: {tool} - {reason} (request_id={request_id})")
-
-        final_verdict = "block"
-        final_reason = reason
-
-        # Try Telegram notification (human in the loop)
-        if self.telegram_bot.is_configured:
-            if self.on_block:
-                self.on_block(tool, f"GRAY: {reason} - waiting for approval...")
-
-            user_response = await self.telegram_bot.notify_gray(
-                request_id=request_id,
-                tool=tool,
-                reason=reason,
-                arguments=arguments,
-                timeout_seconds=self.hold_timeout,
-            )
-
-            if user_response == UserResponse.ALLOW:
-                final_verdict = "allow"
-                final_reason = "approved by user"
-            elif user_response == UserResponse.ALLOW_ALWAYS:
-                final_verdict = "allow"
-                final_reason = "approved by user (added to allowlist)"
-                # Add to allowlist
-                self.store.add_to_allowlist(tool)
-            elif user_response == UserResponse.BLOCK:
-                final_verdict = "block"
-                final_reason = "blocked by user"
-            else:  # TIMEOUT
-                final_verdict = "block"
-                final_reason = "no response - blocked for safety"
-
+            return await self._forward_raw(call.raw)
         else:
-            # No Telegram configured - block for safety
-            final_verdict = "block"
-            final_reason = "gray area - blocked (Telegram not configured)"
-            if self.on_block:
-                self.on_block(tool, final_reason)
-
-        # Log the decision
-        self.store.log_event(
-            tool=tool,
-            arguments=arguments,
-            verdict=final_verdict,
-            rule=rule,
-            reason=final_reason,
-        )
-
-        if final_verdict == "allow":
-            logger.info(f"GRAY->ALLOW: {tool} - {final_reason}")
-            return await self._forward_request({
-                "jsonrpc": "2.0",
-                "method": "tool/call",
-                "params": {"tool": tool, "arguments": arguments},
-                "id": req_id,
-            })
-        else:
-            logger.warning(f"GRAY->BLOCK: {tool} - {final_reason}")
-            if self.on_block:
-                self.on_block(tool, final_reason)
-
-            return make_error_response(
-                req_id,
-                JSONRPCError.GRAY,
-                f"ClawSafe blocked: {final_reason}",
-                {"verdict": "block", "rule": rule}
+            deny_decision = Decision.block(
+                reason="User denied via phone override",
+                rule_name="user_override"
             )
+            await self.audit.log_event(
+                tool=call.tool,
+                arguments=call.arguments,
+                verdict="block",
+                rule_name=deny_decision.rule_name,
+                reason=deny_decision.reason,
+                cloud_used=True,
+                overridden=True,
+            )
+            return self._make_error(call.request_id, deny_decision.reason)
 
-    async def _forward_request(self, req: dict) -> dict:
-        """Forward a request to the target endpoint."""
-        if not self.target_endpoint:
-            return make_success_response(
-                req.get("id"),
-                {"status": "forwarded (no target configured)"}
+    async def handle_user_override(self, action_id: str, verdict: str) -> bool:
+        """Called by Telegram bot when user replies."""
+        future = self._pending.get(action_id)
+        if future is None or future.done():
+            return False
+        future.set_result(verdict)
+        return True
+
+    async def _forward_raw(self, message: dict[str, Any]) -> dict[str, Any]:
+        """Forward a message to the real OpenClaw endpoint."""
+        endpoint = self.config.openclaw_original_endpoint
+        if not endpoint:
+            return self._make_error(
+                message.get("id"),
+                "ClawSafe: original endpoint not configured. Run: clawsafe wrap openclaw"
             )
 
         try:
-            response = await self.http_client.post(
-                self.target_endpoint,
-                json=req,
-                headers={"Content-Type": "application/json"}
+            response = await self._forward_client.post(
+                endpoint,
+                json=message,
+                headers={"Content-Type": "application/json"},
             )
             return response.json()
         except Exception as e:
-            return make_error_response(
-                req.get("id"),
-                JSONRPCError.INTERNAL_ERROR,
-                f"Forward error: {str(e)}"
+            logger.error(f"Forward to {endpoint} failed: {e}")
+            return self._make_error(
+                message.get("id"),
+                f"ClawSafe: failed to forward to OpenClaw endpoint: {e}"
             )
 
-    def run(self):
-        """Run the proxy server (blocking)."""
-        config = uvicorn.Config(
-            self.app,
-            host="127.0.0.1",
-            port=self.port,
-            log_level="info",
-        )
-        server = uvicorn.Server(config)
-        server.run()
+    def _make_error(self, request_id: Any, message: str) -> dict[str, Any]:
+        """Create a JSON-RPC 2.0 error response."""
+        return {
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "error": {
+                "code": -32000,
+                "message": message,
+                "data": {"source": "clawsafe"}
+            }
+        }
 
-    async def start_async(self):
-        """Start the proxy server asynchronously."""
-        config = uvicorn.Config(
-            self.app,
-            host="127.0.0.1",
-            port=self.port,
-            log_level="info",
-        )
-        server = uvicorn.Server(config)
-        await server.serve()
+    async def cleanup(self) -> None:
+        """Graceful shutdown."""
+        if self.cloud_judge:
+            await self.cloud_judge.close()
+        await self._forward_client.aclose()
+        await self.audit.close()
